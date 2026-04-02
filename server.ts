@@ -1,18 +1,15 @@
 #!/usr/bin/env bun
 /**
- * claude-peers MCP server
+ * claude-peers MCP server (v11 — cross-machine)
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to the shared broker daemon for peer discovery and messaging.
- * Declares claude/channel capability to push inbound messages immediately.
- *
- * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
- *
- * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
  */
 
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { join } from "node:path";
+import { hostname as osHostname } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -24,161 +21,441 @@ import type {
   Peer,
   RegisterResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
 import {
   generateSummary,
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { isLoopback, sanitizeForDisplay } from "./shared/net.ts";
 
-// --- Configuration ---
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL =
+  process.env.CLAUDE_PEERS_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
+const AUTH_TOKEN: string | null = process.env.CLAUDE_PEERS_TOKEN ?? null;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = join(import.meta.dir, "broker.ts");
 
-// --- Broker communication ---
+// ---------------------------------------------------------------------------
+// Loopback detection (URL-based)
+// ---------------------------------------------------------------------------
+
+function isBrokerLocal(): boolean {
+  try {
+    const url = new URL(BROKER_URL);
+    return isLoopback(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Timeouts: local 5s, remote 10s
+// ---------------------------------------------------------------------------
+
+const FETCH_TIMEOUT_MS = isBrokerLocal() ? 5_000 : 10_000;
+
+// ---------------------------------------------------------------------------
+// Idempotent paths (retry-safe)
+// ---------------------------------------------------------------------------
+
+const IDEMPOTENT_PATHS = new Set([
+  "/list-peers",
+  "/poll-messages",
+  "/health",
+  "/heartbeat",
+]);
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+function log(msg: string, meta?: Record<string, unknown>) {
+  const suffix = meta
+    ? ` ${JSON.stringify(
+        Object.fromEntries(
+          Object.entries(meta).map(([key, value]) => [
+            key,
+            typeof value === "string" ? sanitizeForDisplay(value) : value,
+          ])
+        )
+      )}`
+    : "";
+  console.error(`[claude-peers] ${msg}${suffix}`);
+}
+
+// ---------------------------------------------------------------------------
+// brokerFetch: auth header, timeout, idempotent-only retry, statusCode prop
+// ---------------------------------------------------------------------------
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BROKER_URL}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json; charset=utf-8",
+  };
+  if (AUTH_TOKEN) {
+    headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
   }
-  return res.json() as Promise<T>;
+
+  const maxRetries =
+    !isBrokerLocal() && IDEMPOTENT_PATHS.has(path) ? 2 : 0;
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`${BROKER_URL}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (res.status === 401) {
+        throw new Error(
+          "Broker authentication failed. Check CLAUDE_PEERS_TOKEN."
+        );
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        const brokerErr = new Error(
+          `Broker error (${path}): ${res.status} ${text}`
+        );
+        (brokerErr as any).statusCode = res.status;
+        throw brokerErr;
+      }
+      return (await res.json()) as T;
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt < maxRetries) {
+        const delay = 1000 * (attempt + 1); // 1s, 2s
+        log(
+          `Broker request failed (${path}), retrying in ${delay}ms... (${attempt + 1}/${maxRetries})`,
+          { error: lastError.message }
+        );
+        await Bun.sleep(delay);
+      }
+    }
+  }
+  throw lastError!;
 }
+
+// ---------------------------------------------------------------------------
+// Broker health check
+// ---------------------------------------------------------------------------
 
 async function isBrokerAlive(): Promise<boolean> {
   try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    const headers: Record<string, string> = {};
+    if (AUTH_TOKEN) {
+      headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+    }
+    const res = await fetch(`${BROKER_URL}/health`, {
+      headers,
+      signal: AbortSignal.timeout(2000),
+    });
     return res.ok;
   } catch {
     return false;
   }
 }
 
+// ---------------------------------------------------------------------------
+// ensureBroker: only auto-start for loopback
+// ---------------------------------------------------------------------------
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
+    log("broker_available", { broker_url: BROKER_URL });
     return;
   }
 
-  log("Starting broker daemon...");
+  if (!isBrokerLocal()) {
+    throw new Error(
+      `Remote broker at ${sanitizeForDisplay(BROKER_URL)} is not reachable. ` +
+        `Ensure the broker is running on the remote machine and firewall allows the port.`
+    );
+  }
+
+  log("starting_local_broker", { broker_url: BROKER_URL });
+  const url = new URL(BROKER_URL);
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_PORT: url.port || String(BROKER_PORT),
+      CLAUDE_PEERS_HOST: url.hostname,
+    },
   });
-
-  // Unref so this process can exit without waiting for the broker
   proc.unref();
 
-  // Wait for it to come up
   for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
+    await Bun.sleep(200);
     if (await isBrokerAlive()) {
-      log("Broker started");
+      log("broker_started", { broker_url: BROKER_URL });
       return;
     }
   }
-  throw new Error("Failed to start broker daemon after 6 seconds");
+
+  throw new Error(
+    `Failed to start broker daemon at ${sanitizeForDisplay(BROKER_URL)} after 6 seconds`
+  );
 }
 
-// --- Utility ---
+// ---------------------------------------------------------------------------
+// Shell command helper
+// ---------------------------------------------------------------------------
 
-function log(msg: string) {
-  // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
-  console.error(`[claude-peers] ${msg}`);
-}
-
-async function getGitRoot(cwd: string): Promise<string | null> {
+async function runCommand(
+  args: string[],
+  cwd = process.cwd()
+): Promise<string> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
+    const proc = Bun.spawn(args, {
       cwd,
       stdout: "pipe",
       stderr: "ignore",
     });
     const text = await new Response(proc.stdout).text();
     const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
+    return code === 0 ? text.trim() : "";
   } catch {
-    // not a git repo
+    return "";
   }
-  return null;
 }
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
+async function getGitRoot(cwd: string): Promise<string | null> {
+  const text = await runCommand(
+    ["git", "rev-parse", "--show-toplevel"],
+    cwd
+  );
+  return text || null;
+}
+
+/**
+ * Normalize a git remote URL to a canonical form for cross-machine matching.
+ *
+ * - host lowercase, path case-sensitive
+ * - credentials removed
+ * - trailing .git / .git/ removed
+ * - trailing slash removed
+ * - URL-decoded path
+ * - file:// -> empty string (local-only, not useful for cross-machine)
+ * - SSH scp-like (git@host:path) supported
+ */
+function normalizeGitRemoteUrl(url: string): string {
+  let normalized = url.trim();
+
+  // file:// is local-only; return empty to disable repo scope
+  if (normalized.startsWith("file://")) {
+    return "";
+  }
+
+  // SSH scp-like format: [user@]host:path (only when no :// present)
+  const scpMatch = normalized.match(/^(?:[\w.-]+@)?([\w.-]+):(.+)/);
+  if (scpMatch && !normalized.includes("://")) {
+    const host = scpMatch[1].toLowerCase();
+    let path = scpMatch[2];
+    path = path.replace(/\.git\/?$/, "");
+    path = path.replace(/^\/+/, "");
+    path = path.replace(/\/+$/, "");
+    try {
+      path = decodeURIComponent(path);
+    } catch {
+      /* invalid encoding, keep as-is */
+    }
+    return `${host}/${path}`;
+  }
+
+  // URL format (ssh://, https://, http://, git://)
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    // Include non-default port
+    const port = parsed.port ? `:${parsed.port}` : "";
+    let path = parsed.pathname;
+    // URL constructor strips credentials automatically
+    path = path.replace(/\.git\/?$/, "");
+    path = path.replace(/^\/+/, "");
+    path = path.replace(/\/+$/, "");
+    // URL decode path
+    try {
+      path = decodeURIComponent(path);
+    } catch {
+      /* keep as-is */
+    }
+    // path is case-sensitive (Git server dependent)
+    return `${host}${port}/${path}`;
+  } catch {
+    // Invalid URL -> empty string (disable repo scope)
+    return "";
+  }
+}
+
+/**
+ * Get the git remote URL, trying origin -> upstream -> first remote.
+ */
+async function getGitRemoteUrl(cwd: string): Promise<string> {
+  // Try origin, then upstream
+  for (const remote of ["origin", "upstream"]) {
+    const url = await runCommand(
+      ["git", "remote", "get-url", remote],
+      cwd
+    );
+    if (url) {
+      return normalizeGitRemoteUrl(url);
+    }
+  }
+
+  // Fallback: first remote
+  const remotes = await runCommand(["git", "remote"], cwd);
+  const firstRemote = remotes.split(/\r?\n/).find(Boolean);
+  if (!firstRemote) {
+    return "";
+  }
+
+  const fallbackUrl = await runCommand(
+    ["git", "remote", "get-url", firstRemote],
+    cwd
+  );
+  return fallbackUrl ? normalizeGitRemoteUrl(fallbackUrl) : "";
+}
+
+// ---------------------------------------------------------------------------
+// TTY detection
+// ---------------------------------------------------------------------------
 
 function getTty(): string | null {
-  try {
-    // Try to get the parent's tty from the process tree
-    const ppid = process.ppid;
-    if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
-      if (tty && tty !== "?" && tty !== "??") {
-        return tty;
-      }
-    }
-  } catch {
-    // ignore
+  if (process.platform === "win32") {
+    return (
+      process.env.TERM_SESSION_ID ?? process.env.WT_SESSION ?? null
+    );
   }
-  return null;
+  try {
+    const ppid = process.ppid;
+    if (!ppid) {
+      return null;
+    }
+    const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
+    const tty = new TextDecoder().decode(proc.stdout).trim();
+    return tty && tty !== "?" && tty !== "??" ? tty : null;
+  } catch {
+    return null;
+  }
 }
 
-// --- State ---
+// ---------------------------------------------------------------------------
+// machine_id: atomic file generation (~/.claude-peers-machine-id, UUID v4)
+// ---------------------------------------------------------------------------
+
+const MACHINE_ID_DIR =
+  process.env.HOME ?? process.env.USERPROFILE ?? ".";
+const MACHINE_ID_PATH = join(MACHINE_ID_DIR, ".claude-peers-machine-id");
+const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function getOrCreateMachineId(): string {
+  // Try reading existing file
+  try {
+    if (existsSync(MACHINE_ID_PATH)) {
+      const id = readFileSync(MACHINE_ID_PATH, "utf-8").trim();
+      if (UUID_V4_REGEX.test(id)) {
+        return id;
+      }
+      // Invalid format -> regenerate
+    }
+  } catch {
+    // File corruption -> regenerate
+  }
+
+  // Atomic write: write to tmp, then rename
+  const id = randomUUID();
+  const tmpPath = `${MACHINE_ID_PATH}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmpPath, id + "\n", "utf-8");
+    renameSync(tmpPath, MACHINE_ID_PATH);
+  } catch {
+    // rename failed (another process created it first) -> re-read
+    try {
+      const existing = readFileSync(MACHINE_ID_PATH, "utf-8").trim();
+      if (existing.length > 0) return existing;
+    } catch {
+      // Worst case: continue with in-memory ID (will be re-created next startup)
+    }
+  }
+  return id;
+}
+
+// ---------------------------------------------------------------------------
+// Instance identity
+// ---------------------------------------------------------------------------
 
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myGitRemoteUrl: string = "";
 
-// --- MCP Server ---
+const myMachineId = getOrCreateMachineId();
+const myMachineName =
+  process.env.CLAUDE_PEERS_MACHINE_NAME ?? osHostname();
+const myInstanceKey = randomUUID(); // session-unique, in-memory only
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
+type PeerScope = "machine" | "directory" | "repo" | "network";
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine or on the local network can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+Read the from_id, from_summary, from_cwd, and from_git_remote_url attributes to understand who sent the message. Use list_peers with scope "network" to find collaborators working on the same remote repository across machines.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
+- list_peers: Discover other Claude Code instances (scope: machine/directory/repo/network)
 - send_message: Send a message to another instance by ID
-- set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
+- set_summary: Set a 1-2 sentence summary of what you're working on
 - check_messages: Manually check for new messages
 
-When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
+NOTE: In network mode, your working directory, git repository info, and summary are visible to peers on other machines. Traffic is plain HTTP (not encrypted). Use only on trusted LANs.
+
+When you start, proactively call set_summary to describe what you're working on.`,
   }
 );
 
-// --- Tool definitions ---
+// ---------------------------------------------------------------------------
+// Tool definitions
+// ---------------------------------------------------------------------------
 
 const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List other Claude Code instances running through the broker. Returns their ID, working directory, git info, and summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
         scope: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo"],
+          enum: ["machine", "directory", "repo", "network"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            '"machine" = same computer (same user). "directory" = same working directory (local only). ' +
+            '"repo" = same git repository (works across machines via git remote URL matching). ' +
+            '"network" = all peers across all machines on the network.',
         },
       },
       required: ["scope"],
@@ -193,7 +470,7 @@ const TOOLS = [
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description: "The peer ID of the target Claude Code instance",
         },
         message: {
           type: "string" as const,
@@ -206,7 +483,7 @@ const TOOLS = [
   {
     name: "set_summary",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
+      "Set a brief summary of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -221,7 +498,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -229,7 +506,36 @@ const TOOLS = [
   },
 ];
 
-// --- Tool handlers ---
+// ---------------------------------------------------------------------------
+// Peer rendering (sanitized)
+// ---------------------------------------------------------------------------
+
+function renderPeer(peer: Peer): string {
+  const parts = [
+    `ID: ${sanitizeForDisplay(peer.id)}`,
+    `PID: ${peer.pid}`,
+    `Machine: ${sanitizeForDisplay(peer.machine_name || "unknown")}`,
+    `CWD: ${sanitizeForDisplay(peer.cwd)}`,
+  ];
+  if (peer.git_root) {
+    parts.push(`Repo root: ${sanitizeForDisplay(peer.git_root)}`);
+  }
+  if (peer.git_remote_url) {
+    parts.push(`Remote: ${sanitizeForDisplay(peer.git_remote_url)}`);
+  }
+  if (peer.tty) {
+    parts.push(`TTY: ${sanitizeForDisplay(peer.tty)}`);
+  }
+  if (peer.summary) {
+    parts.push(`Summary: ${sanitizeForDisplay(peer.summary)}`);
+  }
+  parts.push(`Last seen: ${sanitizeForDisplay(peer.last_seen)}`);
+  return parts.join("\n  ");
+}
+
+// ---------------------------------------------------------------------------
+// Tool handlers
+// ---------------------------------------------------------------------------
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
@@ -240,12 +546,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const scope = ((args as { scope: PeerScope }).scope ??
+        "machine") as PeerScope;
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
+          machine_id: myMachineId,
           cwd: myCwd,
           git_root: myGitRoot,
+          git_remote_url: myGitRemoteUrl,
           exclude_id: myId,
         });
 
@@ -260,33 +569,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
-        });
-
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${peers
+                .map(renderPeer)
+                .join("\n\n")}`,
             },
           ],
         };
-      } catch (e) {
+      } catch (error) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error listing peers: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Error listing peers: ${
+                error instanceof Error
+                  ? sanitizeForDisplay(error.message)
+                  : sanitizeForDisplay(String(error))
+              }`,
             },
           ],
           isError: true,
@@ -295,34 +597,59 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message } = args as {
+        to_id: string;
+        message: string;
+      };
       if (!myId) {
         return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          content: [
+            {
+              type: "text" as const,
+              text: "Not registered with broker yet",
+            },
+          ],
           isError: true,
         };
       }
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+        const result = await brokerFetch<{
+          ok: boolean;
+          error?: string;
+        }>("/send-message", {
           from_id: myId,
           to_id,
           text: message,
         });
         if (!result.ok) {
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+            content: [
+              {
+                type: "text" as const,
+                text: `Failed to send: ${sanitizeForDisplay(result.error ?? "unknown error")}`,
+              },
+            ],
             isError: true,
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [
+            {
+              type: "text" as const,
+              text: `Message sent to peer ${sanitizeForDisplay(to_id)}`,
+            },
+          ],
         };
-      } catch (e) {
+      } catch (error) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Error sending message: ${
+                error instanceof Error
+                  ? sanitizeForDisplay(error.message)
+                  : sanitizeForDisplay(String(error))
+              }`,
             },
           ],
           isError: true,
@@ -334,21 +661,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { summary } = args as { summary: string };
       if (!myId) {
         return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          content: [
+            {
+              type: "text" as const,
+              text: "Not registered with broker yet",
+            },
+          ],
           isError: true,
         };
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
         return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
+          content: [
+            {
+              type: "text" as const,
+              text: `Summary updated: "${sanitizeForDisplay(summary)}"`,
+            },
+          ],
         };
-      } catch (e) {
+      } catch (error) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Error setting summary: ${
+                error instanceof Error
+                  ? sanitizeForDisplay(error.message)
+                  : sanitizeForDisplay(String(error))
+              }`,
             },
           ],
           isError: true,
@@ -359,34 +700,82 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "check_messages": {
       if (!myId) {
         return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          content: [
+            {
+              type: "text" as const,
+              text: "Not registered with broker yet",
+            },
+          ],
           isError: true,
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        const result = await brokerFetch<PollMessagesResponse>(
+          "/poll-messages",
+          { id: myId }
+        );
         if (result.messages.length === 0) {
           return {
-            content: [{ type: "text" as const, text: "No new messages." }],
+            content: [
+              { type: "text" as const, text: "No new messages." },
+            ],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+
+        // Filter out already-delivered messages, then ack the rest
+        const newMessages = result.messages.filter(
+          (m) => !deliveredMessageIds.has(m.id)
         );
+        for (const message of newMessages) {
+          try {
+            await brokerFetch("/ack-message", { message_id: message.id });
+          } catch {
+            deliveredMessageIds.add(message.id);
+          }
+        }
+        // Also retry ack for previously failed messages
+        for (const message of result.messages) {
+          if (deliveredMessageIds.has(message.id)) {
+            try {
+              await brokerFetch("/ack-message", { message_id: message.id });
+              deliveredMessageIds.delete(message.id);
+            } catch { /* retry next time */ }
+          }
+        }
+
+        if (newMessages.length === 0) {
+          return {
+            content: [
+              { type: "text" as const, text: "No new messages." },
+            ],
+          };
+        }
+
+        const lines = newMessages.map(
+          (message) =>
+            `From ${sanitizeForDisplay(message.from_id)} (${sanitizeForDisplay(
+              message.sent_at
+            )}):\n${sanitizeForDisplay(message.text)}`
+        );
+
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${newMessages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
-      } catch (e) {
+      } catch (error) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Error checking messages: ${
+                error instanceof Error
+                  ? sanitizeForDisplay(error.message)
+                  : sanitizeForDisplay(String(error))
+              }`,
             },
           ],
           isError: true,
@@ -399,71 +788,188 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
+// ---------------------------------------------------------------------------
+// pollAndPushMessages: scope:"network" for remote sender resolution
+// ---------------------------------------------------------------------------
+
+// Track delivered message IDs to prevent duplicate delivery on ack failure
+const deliveredMessageIds = new Set<number>();
+const MAX_DELIVERED_TRACKING = 500;
+
+function pruneDeliveredIds() {
+  if (deliveredMessageIds.size > MAX_DELIVERED_TRACKING) {
+    // Remove oldest entries (Set iteration order is insertion order)
+    const excess = deliveredMessageIds.size - MAX_DELIVERED_TRACKING;
+    let removed = 0;
+    for (const id of deliveredMessageIds) {
+      if (removed >= excess) break;
+      deliveredMessageIds.delete(id);
+      removed++;
+    }
+  }
+}
 
 async function pollAndPushMessages() {
-  if (!myId) return;
+  if (!myId) {
+    return;
+  }
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const result = await brokerFetch<PollMessagesResponse>(
+      "/poll-messages",
+      { id: myId }
+    );
+
+    // Resolve senders once outside the loop (avoid N+1 list-peers calls)
+    let peersCache: Peer[] = [];
+    try {
+      peersCache = await brokerFetch<Peer[]>("/list-peers", {
+        scope: "network",
+        machine_id: myMachineId,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        git_remote_url: myGitRemoteUrl,
+      });
+    } catch {
+      // non-critical
+    }
 
     for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
+      // Skip already-delivered messages (ack may have failed on previous poll)
+      if (deliveredMessageIds.has(msg.id)) {
+        try {
+          await brokerFetch("/ack-message", { message_id: msg.id });
+          deliveredMessageIds.delete(msg.id);
+        } catch { /* retry next poll */ }
+        continue;
       }
 
-      // Push as channel notification — this is what makes it immediate
+      const sender = peersCache.find((peer) => peer.id === msg.from_id);
+      const fromSummary = sender?.summary ?? "";
+      const fromCwd = sender?.cwd ?? "";
+      const fromGitRemoteUrl = sender?.git_remote_url ?? "";
+
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: msg.text,
+          content: sanitizeForDisplay(msg.text),
           meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+            from_id: sanitizeForDisplay(msg.from_id),
+            from_summary: sanitizeForDisplay(fromSummary),
+            from_cwd: sanitizeForDisplay(fromCwd),
+            from_git_remote_url: sanitizeForDisplay(fromGitRemoteUrl),
+            sent_at: sanitizeForDisplay(msg.sent_at),
           },
         },
       });
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      // Ack after successful MCP notification delivery
+      try {
+        await brokerFetch("/ack-message", { message_id: msg.id });
+      } catch {
+        // Ack failed — track locally to prevent duplicate notification next poll
+        deliveredMessageIds.add(msg.id);
+      }
+
+      log("message_pushed", {
+        from_id: msg.from_id,
+        preview: msg.text.slice(0, 120),
+      });
     }
-  } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+  } catch (error) {
+    log("poll_error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
+
+  pruneDeliveredIds();
 }
 
-// --- Startup ---
+// ---------------------------------------------------------------------------
+// registerWithRetry: instance_key, 1 retry, retryable check
+// ---------------------------------------------------------------------------
+
+function isRetryable(e: Error): boolean {
+  // Timeout/abort
+  if (e.name === "AbortError" || e.name === "TimeoutError") return true;
+  // Connection errors
+  if (e.message.includes("ECONNREFUSED")) return true;
+  if (e.message.includes("ECONNRESET")) return true;
+  if (e.message.includes("fetch failed")) return true;
+  // 5xx server errors
+  if ((e as any).statusCode >= 500) return true;
+  return false;
+}
+
+async function registerWithRetry(payload: {
+  pid: number;
+  machine_id: string;
+  machine_name: string;
+  cwd: string;
+  git_root: string | null;
+  git_remote_url: string;
+  tty: string | null;
+  summary: string;
+  instance_key: string;
+}): Promise<RegisterResponse> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await brokerFetch<RegisterResponse>("/register", payload);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (attempt === 0 && isRetryable(err)) {
+        log("register_failed_retrying", { error: err.message });
+        await Bun.sleep(2000);
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("unreachable");
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main() {
-  // 1. Ensure broker is running
-  await ensureBroker();
+  // Fail-closed: remote broker requires auth token
+  if (!isBrokerLocal() && !AUTH_TOKEN) {
+    throw new Error(
+      `Remote BROKER_URL requires CLAUDE_PEERS_TOKEN: ${sanitizeForDisplay(BROKER_URL)}`
+    );
+  }
 
-  // 2. Gather context
+  // --- Fix 2: Connect MCP transport FIRST, before broker ---
+  await mcp.connect(new StdioServerTransport());
+  log("mcp_connected");
+
+  // --- Fix 3: Graceful ensureBroker failure handling ---
+  let brokerAvailable = false;
+  try {
+    await ensureBroker();
+    brokerAvailable = true;
+  } catch (e) {
+    log("broker_unavailable", { error: e instanceof Error ? e.message : String(e) });
+  }
+
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  myGitRemoteUrl = await getGitRemoteUrl(myCwd);
   const tty = getTty();
 
-  log(`CWD: ${myCwd}`);
-  log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
+  log("context", {
+    cwd: myCwd,
+    git_root: myGitRoot ?? "(none)",
+    git_remote_url: myGitRemoteUrl || "(none)",
+    tty: tty ?? "(unknown)",
+    machine_id: myMachineId,
+    machine_name: myMachineName,
+    instance_key: myInstanceKey,
+    broker_url: BROKER_URL,
+  });
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
+  // Auto-summary (best-effort, 3s timeout)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {
@@ -477,69 +983,125 @@ async function main() {
       });
       if (summary) {
         initialSummary = summary;
-        log(`Auto-summary: ${summary}`);
+        log("auto_summary_ready", { summary });
       }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    } catch (error) {
+      log("auto_summary_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  await Promise.race([summaryPromise, Bun.sleep(3000)]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  // Helper to perform registration and start timers
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
+  if (brokerAvailable) {
+    const reg = await registerWithRetry({
+      pid: process.pid,
+      machine_id: myMachineId,
+      machine_name: myMachineName,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      git_remote_url: myGitRemoteUrl,
+      tty,
+      summary: initialSummary,
+      instance_key: myInstanceKey,
     });
-  }
+    myId = reg.id;
+    log("registered", { id: myId });
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+    // Apply late summary if auto-summary finished after registration
+    if (!initialSummary) {
+      summaryPromise.then(async () => {
+        if (!initialSummary || !myId) {
+          return;
+        }
+        try {
+          await brokerFetch("/set-summary", {
+            id: myId,
+            summary: initialSummary,
+          });
+          log("late_summary_applied", { summary: initialSummary });
+        } catch {
+          // non-critical
+        }
+      });
+    }
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
-
-  // 7. Start heartbeat
-  const heartbeatTimer = setInterval(async () => {
-    if (myId) {
+    // Polling and heartbeat timers
+    pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+    heartbeatTimer = setInterval(async () => {
+      if (!myId) {
+        return;
+      }
       try {
         await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+      } catch (e) {
+        log("heartbeat_failed", {
+          error: e instanceof Error ? e.message : String(e),
+        });
       }
-    }
-  }, HEARTBEAT_INTERVAL_MS);
+    }, HEARTBEAT_INTERVAL_MS);
+  } else {
+    // Broker unavailable: retry connection every 30 seconds
+    const retryInterval = setInterval(async () => {
+      try {
+        if (await isBrokerAlive()) {
+          clearInterval(retryInterval);
+          try {
+            const reg = await registerWithRetry({
+              pid: process.pid,
+              machine_id: myMachineId,
+              machine_name: myMachineName,
+              cwd: myCwd,
+              git_root: myGitRoot,
+              git_remote_url: myGitRemoteUrl,
+              tty,
+              summary: initialSummary,
+              instance_key: myInstanceKey,
+            });
+            myId = reg.id;
+            log("broker_reconnected", { id: myId });
 
-  // 8. Clean up on exit
+            // Start polling and heartbeat timers
+            pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+            heartbeatTimer = setInterval(async () => {
+              if (!myId) {
+                return;
+              }
+              try {
+                await brokerFetch("/heartbeat", { id: myId });
+              } catch (e) {
+                log("heartbeat_failed", {
+                  error: e instanceof Error ? e.message : String(e),
+                });
+              }
+            }, HEARTBEAT_INTERVAL_MS);
+          } catch (regErr) {
+            log("broker_reconnect_register_failed", {
+              error: regErr instanceof Error ? regErr.message : String(regErr),
+            });
+          }
+        }
+      } catch {
+        // retry next interval
+      }
+    }, 30_000);
+  }
+
+  // Graceful shutdown
   const cleanup = async () => {
-    clearInterval(pollTimer);
-    clearInterval(heartbeatTimer);
+    if (pollTimer) clearInterval(pollTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
+        log("unregistered", { id: myId });
       } catch {
-        // Best effort
+        // best effort
       }
     }
     process.exit(0);
@@ -549,7 +1111,9 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+main().catch((error) => {
+  log("fatal", {
+    error: error instanceof Error ? error.message : String(error),
+  });
   process.exit(1);
 });
