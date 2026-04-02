@@ -12,12 +12,13 @@
 2. [アーキテクチャ](#2-アーキテクチャ)
 3. [前提条件](#3-前提条件)
 4. [事前準備](#4-事前準備)
-5. [ブローカーPC のセットアップ](#5-ブローカーpc-のセットアップ)
+5. [ブローカーPC のセットアップ（LAN内構成）](#5-ブローカーpc-のセットアップ)
 6. [クライアントPC のセットアップ](#6-クライアントpc-のセットアップ)
 7. [動作確認](#7-動作確認)
 8. [トラブルシューティング](#8-トラブルシューティング)
 9. [運用Tips](#9-運用tips)
-10. [用語集](#10-用語集)
+10. [VPS構成（拠点間・リモート接続）](#10-vps構成拠点間リモート接続)
+11. [用語集](#11-用語集)
 
 ---
 
@@ -499,7 +500,191 @@ bun install
 
 ---
 
-## 10. 用語集
+## 10. VPS構成（拠点間・リモート接続）
+
+家と会社など**拠点をまたぐ構成**では、LAN内ブローカーでは以下の問題が発生します:
+
+| 問題 | 説明 |
+|------|------|
+| NAT越え | 家のローカルIPに会社からアクセスできない |
+| セキュリティポリシー | 会社のFWが外部ポートへの接続をブロック |
+| 単一障害点 | ブローカーPCがスリープ/シャットダウンすると全体停止 |
+
+**解決策: VPS（Virtual Private Server）にブローカーを設置する**
+
+### 10.1 構成図
+
+```
+  家 (2台)                   VPS (クラウド)              会社 (8台)
+  ┌──────────┐              ┌─────────────────┐        ┌──────────┐
+  │ PC-A     │──HTTPS/HTTP─►│  broker.ts      │◄─HTTP──│ PC-C     │
+  │ PC-B     │──────────────►│  ポート 7899    │◄───────│ PC-D     │
+  └──────────┘              │  常時稼働       │        │ ...      │
+                            │  固定グローバルIP│        │ PC-J     │
+                            └─────────────────┘        └──────────┘
+```
+
+### 10.2 VPSの選定
+
+| サービス | プラン | 月額 | スペック | 備考 |
+|----------|--------|------|----------|------|
+| ConoHa VPS | 512MB | 約500円 | 1vCPU / 512MB RAM | コスパ最良。broker.tsには十分 |
+| さくらVPS | 512MB | 約590円 | 1vCPU / 512MB RAM | 安定性重視 |
+| AWS Lightsail | nano | $3.50 | 1vCPU / 512MB RAM | AWS慣れしている場合 |
+
+> **broker.tsの消費リソース:** SQLite + HTTPサーバーのみ。10台程度なら512MB RAMで余裕です。
+
+### 10.3 VPSの初期設定
+
+```bash
+# VPSにSSHでログイン
+ssh root@<VPSのIP>
+
+# Bunのインストール
+curl -fsSL https://bun.sh/install | bash
+source ~/.bashrc
+
+# リポジトリのクローン
+cd ~
+git clone https://github.com/mokumeshi/claude-peers-mcp.git
+cd claude-peers-mcp
+bun install
+```
+
+### 10.4 ブローカーの起動（systemd でデーモン化）
+
+**サービスファイルの作成:**
+```bash
+cat > /etc/systemd/system/claude-peers-broker.service << 'EOF'
+[Unit]
+Description=claude-peers broker daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/claude-peers-mcp
+Environment=CLAUDE_PEERS_HOST=0.0.0.0
+Environment=CLAUDE_PEERS_TOKEN=<トークン>
+ExecStart=/root/.bun/bin/bun /root/claude-peers-mcp/broker.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+**起動と自動起動の有効化:**
+```bash
+systemctl daemon-reload
+systemctl enable claude-peers-broker
+systemctl start claude-peers-broker
+
+# 状態確認
+systemctl status claude-peers-broker
+
+# ログ確認
+journalctl -u claude-peers-broker -f
+```
+
+### 10.5 セキュリティ設定
+
+VPSのブローカーはインターネットに公開されるため、以下のセキュリティ対策を**必ず**実施してください。
+
+**1. 強力なトークンを使う:**
+```bash
+# ランダムな32文字トークンを生成
+openssl rand -base64 32
+# 出力例: a3Kx9mPqR7vB2nL5wJ8dF4hG6tY0sE1c
+```
+
+短いトークン（`peers2025` 等）はLAN内限定にしてください。VPSでは推測されやすく危険です。
+
+**2. ファイアウォール（ufw）:**
+```bash
+ufw allow 22/tcp      # SSH
+ufw allow 7899/tcp    # claude-peers broker
+ufw enable
+```
+
+**3. fail2ban（推奨）:**
+大量の不正アクセスを自動ブロック。
+```bash
+apt install fail2ban
+```
+
+**4. HTTPS化（任意・推奨）:**
+トークンが平文で流れるのを防ぐため、リバースプロキシ（nginx + Let's Encrypt）でHTTPS化を推奨。
+
+```bash
+apt install nginx certbot python3-certbot-nginx
+
+# nginx設定例
+cat > /etc/nginx/sites-available/claude-peers << 'EOF'
+server {
+    listen 443 ssl;
+    server_name peers.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/peers.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/peers.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:7899;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+
+ln -s /etc/nginx/sites-available/claude-peers /etc/nginx/sites-enabled/
+certbot --nginx -d peers.example.com
+systemctl restart nginx
+```
+
+HTTPS化した場合、クライアントの接続先は:
+```
+CLAUDE_PEERS_BROKER=https://peers.example.com
+```
+
+### 10.6 クライアントPCの設定（VPS向け）
+
+各PCでのMCP登録コマンドが変わります:
+
+```powershell
+# HTTP接続の場合
+claude mcp add --scope user --transport stdio --env CLAUDE_PEERS_TOKEN=<強力なトークン> --env CLAUDE_PEERS_BROKER=http://<VPSのIP>:7899 claude-peers -- "<bunパス>" "~/claude-peers-mcp/server.ts"
+
+# HTTPS接続の場合
+claude mcp add --scope user --transport stdio --env CLAUDE_PEERS_TOKEN=<強力なトークン> --env CLAUDE_PEERS_BROKER=https://peers.example.com claude-peers -- "<bunパス>" "~/claude-peers-mcp/server.ts"
+```
+
+### 10.7 LAN構成からVPS構成への移行
+
+既にLAN内ブローカーで運用中の場合の移行手順:
+
+1. VPSにbrokerをセットアップ（10.3〜10.5）
+2. 全クライアントPCでMCP再登録:
+   ```powershell
+   claude mcp remove claude-peers
+   claude mcp add --scope user --transport stdio --env CLAUDE_PEERS_TOKEN=<新トークン> --env CLAUDE_PEERS_BROKER=http://<VPSのIP>:7899 claude-peers -- "<bunパス>" "server.tsパス"
+   ```
+3. 全Claude Codeセッションを再起動
+4. LAN内ブローカーを停止
+
+### 10.8 VPS構成の注意点
+
+| 項目 | 説明 |
+|------|------|
+| レイテンシ | LAN（<1ms）→ VPS（10-50ms）に増加。体感にはほぼ影響なし |
+| staleタイムアウト | リモートピアは300秒（5分）。VPS構成では全員がリモート扱い |
+| 通信量 | ポーリング1秒間隔 × ピア数。10台なら月数GB程度。VPSの帯域制限に注意 |
+| 障害時 | VPSが落ちると全員が通信不能。VPSの稼働率SLAを確認 |
+| 会社FW | HTTPSなら通常許可される。HTTP:7899はブロックされる可能性あり |
+
+---
+
+## 11. 用語集
 
 | 用語 | 説明 |
 |------|------|
