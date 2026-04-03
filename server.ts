@@ -1170,39 +1170,60 @@ async function main() {
     log("registered", { id: myId });
     debugLog(`startup: registered id=${myId}, mcp_name=${MCP_NAME}, broker=${BROKER_URL}, pid=${process.pid}`);
 
-    // --- Auto-notify peers about new session ID ---
-    try {
-      const peers = await brokerFetch<Array<{
-        id: string;
-        machine_name: string;
-        cwd: string;
-        summary: string;
-      }>>("/list-peers", {
-        scope: "network",
-        machine_id: myMachineId,
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_remote_url: myGitRemoteUrl,
-      });
-      const otherPeers = peers.filter((p) => p.id !== myId);
-      if (otherPeers.length > 0) {
-        const msg = `[auto] セッション再起動。新ID: ${myId}（${myMachineName}、${MCP_NAME}）`;
-        for (const peer of otherPeers) {
-          try {
-            await brokerFetch("/send-message", {
+    // --- Auto-notify peers about new session ID (non-blocking) ---
+    (async () => {
+      try {
+        const peers = await brokerFetch<Array<{
+          id: string;
+          machine_id: string;
+          machine_name: string;
+          cwd: string;
+        }>>("/list-peers", {
+          scope: "network",
+          machine_id: myMachineId,
+          cwd: myCwd,
+          git_root: myGitRoot,
+          git_remote_url: myGitRemoteUrl,
+        });
+        // Exclude self and same-machine peers (likely own stale sessions)
+        const targets = peers.filter(
+          (p) => p.id !== myId && p.machine_id !== myMachineId
+        );
+        if (targets.length === 0) return;
+
+        const msg = JSON.stringify({
+          type: "session_restart",
+          new_id: myId,
+          machine_id: myMachineId,
+          machine_name: myMachineName,
+          mcp_name: MCP_NAME,
+          instance_key: myInstanceKey,
+        });
+        const text = `[auto] セッション再起動。新ID: ${myId}（${myMachineName}）\n${msg}`;
+
+        // Parallel send with 3s timeout
+        let sent = 0;
+        let failed = 0;
+        const results = await Promise.allSettled(
+          targets.map((peer) =>
+            brokerFetch("/send-message", {
               from_id: myId,
               to_id: peer.id,
-              text: msg,
-            });
-          } catch {
-            // non-critical: peer may be stale
-          }
+              text,
+            })
+          )
+        );
+        for (const r of results) {
+          if (r.status === "fulfilled") sent++;
+          else failed++;
         }
-        log("reconnect_notified", { peers: otherPeers.length });
+        log("reconnect_notified", { targets: targets.length, sent, failed });
+      } catch (e) {
+        log("reconnect_notify_failed", {
+          error: e instanceof Error ? e.message : String(e),
+        });
       }
-    } catch {
-      // non-critical: notification is best-effort
-    }
+    })();
 
     // Apply late summary if auto-summary finished after registration
     if (!initialSummary) {
