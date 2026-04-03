@@ -1170,6 +1170,40 @@ async function main() {
     log("registered", { id: myId });
     debugLog(`startup: registered id=${myId}, mcp_name=${MCP_NAME}, broker=${BROKER_URL}, pid=${process.pid}`);
 
+    // --- Auto-notify peers about new session ID ---
+    try {
+      const peers = await brokerFetch<Array<{
+        id: string;
+        machine_name: string;
+        cwd: string;
+        summary: string;
+      }>>("/list-peers", {
+        scope: "network",
+        machine_id: myMachineId,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        git_remote_url: myGitRemoteUrl,
+      });
+      const otherPeers = peers.filter((p) => p.id !== myId);
+      if (otherPeers.length > 0) {
+        const msg = `[auto] セッション再起動。新ID: ${myId}（${myMachineName}、${MCP_NAME}）`;
+        for (const peer of otherPeers) {
+          try {
+            await brokerFetch("/send-message", {
+              from_id: myId,
+              to_id: peer.id,
+              text: msg,
+            });
+          } catch {
+            // non-critical: peer may be stale
+          }
+        }
+        log("reconnect_notified", { peers: otherPeers.length });
+      }
+    } catch {
+      // non-critical: notification is best-effort
+    }
+
     // Apply late summary if auto-summary finished after registration
     if (!initialSummary) {
       summaryPromise.then(async () => {
