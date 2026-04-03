@@ -15,6 +15,36 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
+- `skill-graph-server.ts` — 共有skill-graph HTTPサーバー (port 7901, SQLite+FTS5)。VPSで稼働。
+- `skill-graph-mcp.ts` — skill-graph MCPラッパー。各ピアのClaude Codeから7ツールでアクセス。
+
+## Skill-Graph Server
+
+ピア間技術知見の共有サーバー。YouTube skill-graphとは分離。
+
+```bash
+# ローカル起動
+bun run skill-graph-server.ts
+
+# VPS起動（本番）
+SKILL_GRAPH_PORT=7901 SKILL_GRAPH_HOST=0.0.0.0 SKILL_GRAPH_TOKEN=peers2025 bun run skill-graph-server.ts
+
+# MCP登録
+claude mcp add -e "SKILL_GRAPH_URL=http://210.131.209.71:7901" -e "SKILL_GRAPH_TOKEN=peers2025" -s user skill-graph -- "bunパス" "skill-graph-mcp.tsパス"
+```
+
+### API
+- `POST /nodes` — ノード作成
+- `PUT /nodes/:name` — 更新（楽観ロック、base_version必須）
+- `GET /nodes/:name` — 取得（?format=markdown対応）
+- `GET /nodes` — 一覧（?type=, ?limit=, ?offset=）
+- `GET /nodes/recent` — 最近更新20件
+- `GET /search?q=` — FTS5全文検索
+- `DELETE /nodes/:name` — 削除
+- `GET /health` — ヘルスチェック
+
+### MCP Tools (skill-graph-mcp.ts)
+read_node, write_node, update_node, delete_node, list_nodes, recent_nodes, search_nodes
 
 ## Running
 
