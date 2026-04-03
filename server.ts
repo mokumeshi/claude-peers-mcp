@@ -28,6 +28,18 @@ import {
   getRecentFiles,
 } from "./shared/summarize.ts";
 import { isLoopback, sanitizeForDisplay } from "./shared/net.ts";
+import { appendFileSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Debug file log (temporary — remove after diagnosis)
+// ---------------------------------------------------------------------------
+
+const DEBUG_LOG_PATH = join(import.meta.dir, "debug-poll.log");
+function debugLog(msg: string) {
+  try {
+    appendFileSync(DEBUG_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* ignore */ }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -40,6 +52,18 @@ const AUTH_TOKEN: string | null = process.env.CLAUDE_PEERS_TOKEN ?? null;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = join(import.meta.dir, "broker.ts");
+
+// ---------------------------------------------------------------------------
+// Relay configuration (VPS → LAN workaround for channel notification bug)
+// When set, VPS instance forwards received messages to the LAN broker
+// instead of sending mcp.notification() (which Claude Code ignores from
+// secondary MCP servers). The LAN instance picks them up and sends the
+// notification through its working channel.
+// ---------------------------------------------------------------------------
+
+const RELAY_BROKER: string | null = process.env.CLAUDE_PEERS_RELAY_BROKER ?? null;
+const RELAY_TOKEN: string | null = process.env.CLAUDE_PEERS_RELAY_TOKEN ?? null;
+const RELAY_PREFIX = "__RELAY__";
 
 // ---------------------------------------------------------------------------
 // Loopback detection (URL-based)
@@ -141,6 +165,34 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   }
   throw lastError!;
 }
+
+// ---------------------------------------------------------------------------
+// Relay fetch (for VPS → LAN forwarding)
+// ---------------------------------------------------------------------------
+
+async function relayFetch<T>(path: string, body: unknown): Promise<T> {
+  if (!RELAY_BROKER) throw new Error("Relay not configured");
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json; charset=utf-8",
+  };
+  if (RELAY_TOKEN) {
+    headers["Authorization"] = `Bearer ${RELAY_TOKEN}`;
+  }
+  const res = await fetch(`${RELAY_BROKER}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Relay error (${path}): ${res.status} ${text}`);
+  }
+  return (await res.json()) as T;
+}
+
+let relayTargetId: string | null = null;
+let relayTargetLookupAt = 0;
 
 // ---------------------------------------------------------------------------
 // Broker health check
@@ -412,8 +464,10 @@ const myInstanceKey = randomUUID(); // session-unique, in-memory only
 
 type PeerScope = "machine" | "directory" | "repo" | "network";
 
+const MCP_NAME = process.env.CLAUDE_PEERS_NAME ?? "claude-peers";
+
 const mcp = new Server(
-  { name: "claude-peers", version: "0.2.0" },
+  { name: MCP_NAME, version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -421,7 +475,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine or on the local network can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work.
+IMPORTANT: When you receive a <channel source="${MCP_NAME}" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work.
 
 Read the from_id, from_summary, from_cwd, and from_git_remote_url attributes to understand who sent the message. Use list_peers with scope "network" to find collaborators working on the same remote repository across machines.
 
@@ -789,6 +843,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 // ---------------------------------------------------------------------------
+// Relay target discovery (VPS → LAN)
+// ---------------------------------------------------------------------------
+
+async function findRelayTarget(): Promise<string | null> {
+  const now = Date.now();
+  // Cache for 60s
+  if (relayTargetId && now - relayTargetLookupAt < 60_000) return relayTargetId;
+  try {
+    const peers = await relayFetch<Peer[]>("/list-peers", {
+      scope: "machine",
+      machine_id: myMachineId,
+      cwd: myCwd,
+    });
+    // Find ANY peer on the LAN broker from the same machine
+    const target = peers.find((p) => p.machine_id === myMachineId);
+    relayTargetId = target?.id ?? null;
+    relayTargetLookupAt = now;
+    if (relayTargetId) {
+      debugLog(`relay_target_found: ${relayTargetId}`);
+    }
+    return relayTargetId;
+  } catch (err) {
+    debugLog(`relay_target_lookup_error: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // pollAndPushMessages: scope:"network" for remote sender resolution
 // ---------------------------------------------------------------------------
 
@@ -811,6 +893,7 @@ function pruneDeliveredIds() {
 
 async function pollAndPushMessages() {
   if (!myId) {
+    debugLog(`poll_skip: myId is null`);
     return;
   }
 
@@ -819,6 +902,9 @@ async function pollAndPushMessages() {
       "/poll-messages",
       { id: myId }
     );
+    if (result.messages.length > 0) {
+      debugLog(`poll_received: ${result.messages.length} messages, myId=${myId}, broker=${BROKER_URL}`);
+    }
 
     // Resolve senders once outside the loop (avoid N+1 list-peers calls)
     let peersCache: Peer[] = [];
@@ -844,24 +930,94 @@ async function pollAndPushMessages() {
         continue;
       }
 
-      const sender = peersCache.find((peer) => peer.id === msg.from_id);
-      const fromSummary = sender?.summary ?? "";
-      const fromCwd = sender?.cwd ?? "";
-      const fromGitRemoteUrl = sender?.git_remote_url ?? "";
+      // --- Relay mode (VPS → LAN broker forwarding) ---
+      if (RELAY_BROKER) {
+        const relayTarget = await findRelayTarget();
+        if (relayTarget) {
+          // Resolve sender info from VPS broker peers
+          const sender = peersCache.find((peer) => peer.id === msg.from_id);
+          const meta = JSON.stringify({
+            from_id: msg.from_id,
+            from_summary: sender?.summary ?? "",
+            from_cwd: sender?.cwd ?? "",
+            from_git_remote_url: sender?.git_remote_url ?? "",
+            sent_at: msg.sent_at,
+          });
+          const relayText = `${RELAY_PREFIX}${meta}${RELAY_PREFIX}\n${msg.text}`;
+          try {
+            await relayFetch("/send-message", {
+              from_id: msg.from_id,
+              to_id: relayTarget,
+              text: relayText,
+            });
+            debugLog(`relay_ok: from=${msg.from_id}, to_lan=${relayTarget}, preview=${msg.text.slice(0, 60)}`);
+          } catch (relayErr) {
+            debugLog(`relay_error: ${relayErr instanceof Error ? relayErr.message : String(relayErr)}`);
+            // Fall through — message will not be delivered but we still ack to avoid infinite retry
+          }
+          // Ack on source broker
+          try {
+            await brokerFetch("/ack-message", { message_id: msg.id });
+          } catch {
+            deliveredMessageIds.add(msg.id);
+          }
+          continue;
+        } else {
+          debugLog(`relay_no_target: falling back to direct notification`);
+        }
+      }
 
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: sanitizeForDisplay(msg.text),
-          meta: {
-            from_id: sanitizeForDisplay(msg.from_id),
-            from_summary: sanitizeForDisplay(fromSummary),
-            from_cwd: sanitizeForDisplay(fromCwd),
-            from_git_remote_url: sanitizeForDisplay(fromGitRemoteUrl),
-            sent_at: sanitizeForDisplay(msg.sent_at),
+      // --- Normal mode: detect relay prefix or send notification directly ---
+      let messageText = msg.text;
+      let fromId = msg.from_id;
+      let fromSummary = "";
+      let fromCwd = "";
+      let fromGitRemoteUrl = "";
+      let sentAt = msg.sent_at;
+
+      if (messageText.startsWith(RELAY_PREFIX)) {
+        // Parse relayed metadata from VPS instance
+        const endIdx = messageText.indexOf(RELAY_PREFIX, RELAY_PREFIX.length);
+        if (endIdx !== -1) {
+          try {
+            const relayMeta = JSON.parse(
+              messageText.slice(RELAY_PREFIX.length, endIdx)
+            );
+            fromId = relayMeta.from_id ?? fromId;
+            fromSummary = relayMeta.from_summary ?? "";
+            fromCwd = relayMeta.from_cwd ?? "";
+            fromGitRemoteUrl = relayMeta.from_git_remote_url ?? "";
+            sentAt = relayMeta.sent_at ?? sentAt;
+            messageText = messageText.slice(endIdx + RELAY_PREFIX.length).replace(/^\n/, "");
+            debugLog(`relay_received: from=${fromId}, summary=${fromSummary}`);
+          } catch { /* not valid relay format, treat as normal */ }
+        }
+      } else {
+        const sender = peersCache.find((peer) => peer.id === msg.from_id);
+        fromSummary = sender?.summary ?? "";
+        fromCwd = sender?.cwd ?? "";
+        fromGitRemoteUrl = sender?.git_remote_url ?? "";
+      }
+
+      debugLog(`notification_sending: from=${fromId}, preview=${messageText.slice(0,80)}, mcp_name=${MCP_NAME}`);
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: sanitizeForDisplay(messageText),
+            meta: {
+              from_id: sanitizeForDisplay(fromId),
+              from_summary: sanitizeForDisplay(fromSummary),
+              from_cwd: sanitizeForDisplay(fromCwd),
+              from_git_remote_url: sanitizeForDisplay(fromGitRemoteUrl),
+              sent_at: sanitizeForDisplay(sentAt),
+            },
           },
-        },
-      });
+        });
+        debugLog(`notification_sent_ok: from=${fromId}`);
+      } catch (notifErr) {
+        debugLog(`notification_send_error: ${notifErr instanceof Error ? notifErr.message : String(notifErr)}`);
+      }
 
       // Ack after successful MCP notification delivery
       try {
@@ -1012,6 +1168,7 @@ async function main() {
     });
     myId = reg.id;
     log("registered", { id: myId });
+    debugLog(`startup: registered id=${myId}, mcp_name=${MCP_NAME}, broker=${BROKER_URL}, pid=${process.pid}`);
 
     // Apply late summary if auto-summary finished after registration
     if (!initialSummary) {
