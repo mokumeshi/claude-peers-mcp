@@ -1085,6 +1085,93 @@ async function registerWithRetry(payload: {
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect notification (extracted for testability)
+// ---------------------------------------------------------------------------
+
+const MAX_NOTIFY_TARGETS = 20;
+const NOTIFY_TIMEOUT_MS = 5000;
+
+async function notifyPeersOfRestart(newId: string): Promise<void> {
+  try {
+    const peers = await brokerFetch<Array<{
+      id: string;
+      machine_id: string;
+      instance_key: string;
+    }>>("/list-peers", {
+      scope: "network",
+      machine_id: myMachineId,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      git_remote_url: myGitRemoteUrl,
+    });
+
+    if (!Array.isArray(peers)) return;
+
+    // Exclude: self (by id) and own stale sessions (same machine_id + same instance_key)
+    // Keep: other sessions on same machine (different instance_key = different peer)
+    const seen = new Set<string>();
+    const targets: Array<{ id: string }> = [];
+    for (const p of peers) {
+      if (!p || typeof p.id !== "string") continue;
+      if (p.id === newId) continue;
+      if (p.machine_id === myMachineId && p.instance_key === myInstanceKey) continue;
+      if (seen.has(p.id)) continue;
+      seen.add(p.id);
+      targets.push(p);
+    }
+
+    if (targets.length === 0) return;
+
+    // Cap targets to prevent broker overload
+    const capped = targets.slice(0, MAX_NOTIFY_TARGETS);
+
+    const payload = JSON.stringify({
+      type: "session_restart",
+      new_id: newId,
+      machine_id: myMachineId,
+      machine_name: myMachineName,
+      mcp_name: MCP_NAME,
+    });
+
+    // Parallel send with timeout
+    let sent = 0;
+    let failed = 0;
+    const failedPeers: string[] = [];
+    const results = await Promise.race([
+      Promise.allSettled(
+        capped.map((peer) =>
+          brokerFetch("/send-message", {
+            from_id: newId,
+            to_id: peer.id,
+            text: payload,
+          })
+        )
+      ),
+      Bun.sleep(NOTIFY_TIMEOUT_MS).then(() => null),
+    ]);
+
+    if (results === null) {
+      log("reconnect_notify_timeout", { targets: capped.length });
+      return;
+    }
+
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === "fulfilled") {
+        sent++;
+      } else {
+        failed++;
+        failedPeers.push(capped[i].id);
+      }
+    }
+    log("reconnect_notified", { targets: capped.length, sent, failed, failedPeers });
+  } catch (e) {
+    log("reconnect_notify_failed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1171,59 +1258,7 @@ async function main() {
     debugLog(`startup: registered id=${myId}, mcp_name=${MCP_NAME}, broker=${BROKER_URL}, pid=${process.pid}`);
 
     // --- Auto-notify peers about new session ID (non-blocking) ---
-    (async () => {
-      try {
-        const peers = await brokerFetch<Array<{
-          id: string;
-          machine_id: string;
-          machine_name: string;
-          cwd: string;
-        }>>("/list-peers", {
-          scope: "network",
-          machine_id: myMachineId,
-          cwd: myCwd,
-          git_root: myGitRoot,
-          git_remote_url: myGitRemoteUrl,
-        });
-        // Exclude self and same-machine peers (likely own stale sessions)
-        const targets = peers.filter(
-          (p) => p.id !== myId && p.machine_id !== myMachineId
-        );
-        if (targets.length === 0) return;
-
-        const msg = JSON.stringify({
-          type: "session_restart",
-          new_id: myId,
-          machine_id: myMachineId,
-          machine_name: myMachineName,
-          mcp_name: MCP_NAME,
-          instance_key: myInstanceKey,
-        });
-        const text = `[auto] セッション再起動。新ID: ${myId}（${myMachineName}）\n${msg}`;
-
-        // Parallel send with 3s timeout
-        let sent = 0;
-        let failed = 0;
-        const results = await Promise.allSettled(
-          targets.map((peer) =>
-            brokerFetch("/send-message", {
-              from_id: myId,
-              to_id: peer.id,
-              text,
-            })
-          )
-        );
-        for (const r of results) {
-          if (r.status === "fulfilled") sent++;
-          else failed++;
-        }
-        log("reconnect_notified", { targets: targets.length, sent, failed });
-      } catch (e) {
-        log("reconnect_notify_failed", {
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
-    })();
+    notifyPeersOfRestart(myId);
 
     // Apply late summary if auto-summary finished after registration
     if (!initialSummary) {
