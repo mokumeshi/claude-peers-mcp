@@ -1095,8 +1095,6 @@ async function notifyPeersOfRestart(newId: string): Promise<void> {
   try {
     const peers = await brokerFetch<Array<{
       id: string;
-      machine_id: string;
-      instance_key: string;
     }>>("/list-peers", {
       scope: "network",
       machine_id: myMachineId,
@@ -1107,14 +1105,14 @@ async function notifyPeersOfRestart(newId: string): Promise<void> {
 
     if (!Array.isArray(peers)) return;
 
-    // Exclude: self (by id) and own stale sessions (same machine_id + same instance_key)
-    // Keep: other sessions on same machine (different instance_key = different peer)
+    // Exclude only self by id. Stale sessions are physically deleted by broker
+    // within 90s (local) / 300s (remote), so they rarely appear here.
+    // instance_key is DB-internal and not returned by list-peers.
     const seen = new Set<string>();
     const targets: Array<{ id: string }> = [];
     for (const p of peers) {
       if (!p || typeof p.id !== "string") continue;
       if (p.id === newId) continue;
-      if (p.machine_id === myMachineId && p.instance_key === myInstanceKey) continue;
       if (seen.has(p.id)) continue;
       seen.add(p.id);
       targets.push(p);
