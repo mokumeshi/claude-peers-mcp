@@ -1170,6 +1170,65 @@ async function notifyPeersOfRestart(newId: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Ghost peer cleanup (same machine, dead PID)
+// ---------------------------------------------------------------------------
+
+const GHOST_CLEANUP_TIMEOUT_MS = 5000;
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cleanGhostPeers(selfId: string): Promise<void> {
+  try {
+    const peers = await Promise.race([
+      brokerFetch<Array<{ id: string; pid: number; machine_id: string }>>("/list-peers", {
+        scope: "machine",
+        machine_id: myMachineId,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        git_remote_url: myGitRemoteUrl,
+      }),
+      Bun.sleep(GHOST_CLEANUP_TIMEOUT_MS).then(() => null),
+    ]);
+
+    if (!Array.isArray(peers)) {
+      log("ghost_cleanup_skipped", { reason: "timeout_or_invalid_response" });
+      return;
+    }
+
+    let cleaned = 0;
+    for (const peer of peers) {
+      if (peer.id === selfId) continue;
+      if (peer.machine_id !== myMachineId) continue;
+
+      if (!isPidAlive(peer.pid)) {
+        try {
+          await brokerFetch("/unregister", { id: peer.id });
+          cleaned++;
+          log("ghost_cleaned", { id: peer.id, pid: peer.pid });
+        } catch {
+          // best effort
+        }
+      }
+    }
+
+    if (cleaned > 0) {
+      log("ghost_cleanup_done", { cleaned });
+    }
+  } catch (e) {
+    log("ghost_cleanup_failed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1258,6 +1317,9 @@ async function main() {
     // --- Auto-notify peers about new session ID (non-blocking) ---
     notifyPeersOfRestart(myId);
 
+    // --- Clean ghost peers from same machine (non-blocking) ---
+    cleanGhostPeers(myId);
+
     // Apply late summary if auto-summary finished after registration
     if (!initialSummary) {
       summaryPromise.then(async () => {
@@ -1310,6 +1372,9 @@ async function main() {
             });
             myId = reg.id;
             log("broker_reconnected", { id: myId });
+
+            // Clean ghost peers on reconnect (non-blocking)
+            cleanGhostPeers(myId);
 
             // Start polling and heartbeat timers
             pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
