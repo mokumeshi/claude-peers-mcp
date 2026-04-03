@@ -202,6 +202,9 @@ const updateSummary = db.prepare(
 );
 
 const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
+const deleteLegacyPeersByRemoteAddr = db.prepare(
+  "DELETE FROM peers WHERE instance_key = '' AND remote_addr = ? RETURNING id"
+);
 
 const selectAllPeers = db.prepare(
   `SELECT ${PEER_COLUMNS} FROM peers ORDER BY last_seen DESC`
@@ -476,6 +479,19 @@ function handleRegister(
       now,
       now
     ) as { id: string };
+
+    // Clean up legacy entries (empty instance_key) from same remote_addr
+    const deleted = deleteLegacyPeersByRemoteAddr.all(remoteAddr) as Array<{ id: string }>;
+    for (const d of deleted) {
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [d.id]);
+    }
+    if (deleted.length > 0) {
+      log("cleaned_legacy_peers", {
+        count: deleted.length,
+        remote_addr: remoteAddr,
+        deleted_ids: deleted.map(d => d.id),
+      });
+    }
 
     log("register_upsert", {
       id: result.id,
